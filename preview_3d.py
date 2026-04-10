@@ -51,10 +51,10 @@ def _placement_hover_lines(p: Dict[str, Any], adr_by_id: Dict[int, bool]) -> str
         f"<b>ID {pid}</b><br>{name}{adr_line}<br>"
         f"<b>Dimensions (l×b×h)</b><br>"
         f"{p['l']:.3f} × {p['b']:.3f} × {p['h']:.3f} m<br>"
-        f"<b>Position (x,y,z)</b><br>"
-        f"{p['x']:.3f}, {p['y']:.3f}, {p['z']:.3f} m<br>"
-        f"<b>Weight</b> {p['weight']:.1f} kg<br>"
-        f"<b>Stack level</b> {p['level']}"
+        # f"<b>Position (x,y,z)</b><br>"
+        # f"{p['x']:.3f}, {p['y']:.3f}, {p['z']:.3f} m<br>"
+        # f"<b>Weight</b> {p['weight']:.1f} kg<br>"
+        # f"<b>Stack level</b> {p['level']}"
         "<extra></extra>"
     )
 
@@ -127,13 +127,13 @@ def _plotly_truck_cargo_hull_trace(l: float, b: float, h: float, truck_name: str
     return go.Mesh3d(
         x=vx,
         y=vy,
-        z=vz,
+        # z=vz,
         i=_MESH_I,
         j=_MESH_J,
         k=_MESH_K,
         color="rgb(160, 175, 205)",
-        opacity=0.22,
-        hovertemplate=hover,
+        opacity=0.5,
+        # hovertemplate=hover,
         name="Cargo space",
         showlegend=False,
         lighting=dict(ambient=0.55, diffuse=0.5),
@@ -171,6 +171,8 @@ def build_plotly_figure(
         vertical_spacing=0.06,
         horizontal_spacing=0.04,
     )
+    # Keep per-subplot titles visually separated from the main figure title.
+    fig.update_annotations(font=dict(size=20), yshift=-5)
 
     for idx, plan in enumerate(plans):
         r = idx // cols + 1
@@ -209,11 +211,16 @@ def build_plotly_figure(
 
     fig.update_layout(
         title=dict(
-            text="Load preview — shaded box = truck cargo (l×b×h from truck row); hover cargo or goods",
+            text=(
+                "Load preview — shaded box = truck cargo (l×b×h from truck row)"
+                "<br><sup>Hover cargo or goods</sup>"
+            ),
             x=0.5,
             xanchor="center",
+            y=0.985,
+            yanchor="top",
         ),
-        margin=dict(l=0, r=0, t=60, b=0),
+        margin=dict(l=0, r=0, t=130, b=0),
         height=1080 * rows,
     )
 
