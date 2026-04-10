@@ -65,11 +65,11 @@ def _plotly_color_for_placement(
     """Returns (plotly color string, opacity)."""
     is_adr = adr_by_id.get(int(p["ID"]), False)
     if is_adr:
-        return "rgb(220,90,80)", 0.62
+        return "rgb(220,90,80)", 1
     cmap = plt.get_cmap(cmap_name)
     base = cmap(i % cmap.N)
     r, g, b = int(base[0] * 255), int(base[1] * 255), int(base[2] * 255)
-    return f"rgb({r},{g},{b})", 0.5
+    return f"rgb({r},{g},{b})", 1
 
 
 def _plotly_truck_wireframe_trace(l: float, b: float, h: float) -> Any:
@@ -214,11 +214,12 @@ def build_plotly_figure(
             xanchor="center",
         ),
         margin=dict(l=0, r=0, t=60, b=0),
-        height=520 * rows,
+        height=1080 * rows,
     )
 
     # Equal-ish axes per 3D subplot (first is "scene", then "scene2", "scene3", …)
     scene_layout: Dict[str, Any] = {}
+    zoom = 5
     for idx, plan in enumerate(plans):
         dims = plan["truck_dims"]
         tl, tb, th = dims["l"], dims["b"], dims["h"]
@@ -229,7 +230,7 @@ def build_plotly_figure(
             zaxis=dict(title="h (m)", range=[0, th], backgroundcolor="rgb(248,248,248)"),
             aspectmode="manual",
             aspectratio=dict(x=float(tl), y=float(tb), z=float(th)),
-            camera=dict(eye=dict(x=1.35, y=-1.55, z=0.85)),
+            camera=dict(eye=dict(x=1.35*zoom, y=-1.55*zoom, z=0.85*zoom)),
         )
     fig.update_layout(**scene_layout)
 

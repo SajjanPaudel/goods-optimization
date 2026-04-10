@@ -1,5 +1,2 @@
 id,name,l,b,h,max_weight_kg,max_volume_m3,adr_suitable,adr_classes_allowed
 SCANIA_3,Scania P360,7.7,2.48,2.7,28000,90.0,true,*
-JUMBO_01,Jumbo Utrekk,13.6,2.48,3.0,38000,100.0,true,*
-LOW_BED_01,Low Bed,13.6,2.55,3.2,45000,85.0,false,None
-CLOSED_01,Closed Trailer,13.6,2.48,2.7,33000,90.0,true,1-9
