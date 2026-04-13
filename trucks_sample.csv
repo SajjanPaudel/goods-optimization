@@ -1,2 +1,6 @@
 id,name,l,b,h,max_weight_kg,max_volume_m3,adr_suitable,adr_classes_allowed
 SCANIA_3,Scania P360,7.7,2.48,2.7,28000,90.0,true,*
+SCANIA_4,Scania P360new,7.7,2.48,2.7,28000,90.0,true,*
+SCANIA_5,Scania P360new,7.7,2.48,2.7,28000,90.0,true,*
+SCANIA_6,Scania P360new,7.7,2.48,2.7,28000,90.0,true,*
+SCANIA_7,Scania P360new,7.7,2.48,2.7,28000,90.0,true,*  

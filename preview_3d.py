@@ -53,7 +53,7 @@ def _placement_hover_lines(p: Dict[str, Any], adr_by_id: Dict[int, bool]) -> str
         f"{p['l']:.3f} × {p['b']:.3f} × {p['h']:.3f} m<br>"
         # f"<b>Position (x,y,z)</b><br>"
         # f"{p['x']:.3f}, {p['y']:.3f}, {p['z']:.3f} m<br>"
-        # f"<b>Weight</b> {p['weight']:.1f} kg<br>"
+        f"<b>Weight</b> {p['weight']:.1f} kg<br>"
         # f"<b>Stack level</b> {p['level']}"
         "<extra></extra>"
     )
@@ -156,9 +156,16 @@ def build_plotly_figure(
     for p in plans:
         d = p["truck_dims"]
         tl, tb, th = d["l"], d["b"], d["h"]
+        truck_volume = float(tl) * float(tb) * float(th)
+        placed_volume = sum(
+            float(item["l"]) * float(item["b"]) * float(item["h"])
+            for item in p["placements"]
+        )
+        volume_util_pct = (placed_volume / truck_volume * 100.0) if truck_volume > 0 else 0.0
         titles_list.append(
             f"{p['truck']}<br><sup>{tl:g}×{tb:g}×{th:g} m cargo</sup> — "
-            f"{p['placed_count']} goods, {p['weight_util_pct']:.0f}% wt"
+            f"{p['placed_count']} goods, {p['weight_util_pct']:.0f}% wt, "
+            f"{placed_volume:.1f}/{truck_volume:.1f} m³ ({volume_util_pct:.0f}% vol)"
         )
     while len(titles_list) < rows * cols:
         titles_list.append("")

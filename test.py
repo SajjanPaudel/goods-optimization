@@ -415,12 +415,12 @@ def print_plan(plan: Dict[str, Any]) -> None:
             f"w={p['weight']} kg, level={p['level']}"
         )
     if plan["unplaced"]:
-        print("  Not loaded in this truck:")
+        # print("  Not loaded in this truck:")
         for u in plan["unplaced"]:
             adr_note = ""
             if u.get("adr"):
                 adr_note = f", ADR class {u.get('adr_class', '') or '?'}"
-            print(f"    - ID {u['ID']} ({u['name']}), w={u['weight']} kg{adr_note}")
+            # print(f"    - ID {u['ID']} ({u['name']}), w={u['weight']} kg{adr_note}")
 
 
 def print_allocation_summary(plans: List[Dict[str, Any]], remaining: pd.DataFrame) -> None:
@@ -432,7 +432,7 @@ def print_allocation_summary(plans: List[Dict[str, Any]], remaining: pd.DataFram
             extra = ""
             if _as_bool(row.get("adr"), False):
                 extra = f" [ADR class {row.get('adr_class', '') or '?'}]"
-            print(f"  - ID {row['id']} ({row['name']}){extra}")
+            print(f"  - ID {row['id']} ({row['name']}){extra} w={row['weight_kg']} kg, l={row['l']} m, b={row['b']} m, h={row['h']} m")
     else:
         print(f"\nAll goods assigned with {len(plans)} truck(s).")
 
