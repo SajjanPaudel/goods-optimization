@@ -182,6 +182,107 @@ def merge_free_rectangles(
     return out
 
 
+def _rect_overlap(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+    eps: float = 1e-9,
+) -> Optional[Tuple[float, float, float, float]]:
+    ax, ay, al, ab = a
+    bx, by, bl, bb = b
+    ox1 = max(ax, bx)
+    oy1 = max(ay, by)
+    ox2 = min(ax + al, bx + bl)
+    oy2 = min(ay + ab, by + bb)
+    if (ox2 - ox1) <= eps or (oy2 - oy1) <= eps:
+        return None
+    return (ox1, oy1, ox2 - ox1, oy2 - oy1)
+
+
+def _subtract_rect(
+    rect: Tuple[float, float, float, float],
+    cut: Tuple[float, float, float, float],
+    eps: float = 1e-9,
+) -> List[Tuple[float, float, float, float]]:
+    overlap = _rect_overlap(rect, cut, eps=eps)
+    if overlap is None:
+        return [rect]
+    rx, ry, rl, rb = rect
+    ox, oy, ol, ob = overlap
+    rx2, ry2 = rx + rl, ry + rb
+    ox2, oy2 = ox + ol, oy + ob
+    out: List[Tuple[float, float, float, float]] = []
+
+    # Left and right strips.
+    if (ox - rx) > eps:
+        out.append((rx, ry, ox - rx, rb))
+    if (rx2 - ox2) > eps:
+        out.append((ox2, ry, rx2 - ox2, rb))
+    # Bottom and top strips in the middle x-range.
+    if (oy - ry) > eps:
+        out.append((ox, ry, ol, oy - ry))
+    if (ry2 - oy2) > eps:
+        out.append((ox, oy2, ol, ry2 - oy2))
+    return out
+
+
+def _footprint_fully_supported(
+    x: float,
+    y: float,
+    l: float,
+    b: float,
+    support_rects: List[Tuple[float, float, float, float]],
+    eps: float = 1e-9,
+) -> bool:
+    target = (x, y, l, b)
+    clipped: List[Tuple[float, float, float, float]] = []
+    for rect in support_rects:
+        overlap = _rect_overlap(rect, target, eps=eps)
+        if overlap is not None:
+            clipped.append(overlap)
+    if not clipped:
+        return False
+
+    xs = sorted({x, x + l, *[r[0] for r in clipped], *[r[0] + r[2] for r in clipped]})
+    ys = sorted({y, y + b, *[r[1] for r in clipped], *[r[1] + r[3] for r in clipped]})
+    for i in range(len(xs) - 1):
+        for j in range(len(ys) - 1):
+            if (xs[i + 1] - xs[i]) <= eps or (ys[j + 1] - ys[j]) <= eps:
+                continue
+            cx = (xs[i] + xs[i + 1]) * 0.5
+            cy = (ys[j] + ys[j + 1]) * 0.5
+            covered = any(
+                (rx - eps) <= cx <= (rx + rl + eps) and (ry - eps) <= cy <= (ry + rb + eps)
+                for rx, ry, rl, rb in clipped
+            )
+            if not covered:
+                return False
+    return True
+
+
+def _reserve_base_top_area(
+    base: Dict[str, Any],
+    world_rect: Tuple[float, float, float, float],
+) -> None:
+    top_free_rects: List[Tuple[float, float, float, float]] = base.setdefault(
+        "top_free_rects", [(0.0, 0.0, base["l"], base["b"])]
+    )
+    updated: List[Tuple[float, float, float, float]] = []
+    for fr in top_free_rects:
+        world_fr = (base["x"] + fr[0], base["y"] + fr[1], fr[2], fr[3])
+        overlap = _rect_overlap(world_fr, world_rect)
+        if overlap is None:
+            updated.append(fr)
+            continue
+        local_cut = (
+            overlap[0] - base["x"],
+            overlap[1] - base["y"],
+            overlap[2],
+            overlap[3],
+        )
+        updated.extend(_subtract_rect(fr, local_cut))
+    base["top_free_rects"] = merge_free_rectangles(updated)
+
+
 def try_place_on_floor(
     item: Dict[str, Any],
     free_rects: List[Tuple[float, float, float, float]],
@@ -220,6 +321,7 @@ def try_stack(
     placements: List[Dict[str, Any]],
     truck_height: float,
 ) -> Optional[Dict[str, Any]]:
+    eps = 1e-9
     for base in sorted(placements, key=lambda p: (p["weight"], p["l"] * p["b"]), reverse=True):
         new_level = int(base.get("level", 0)) + 1
         # Stack limit is interpreted as max allowed levels count per column:
@@ -230,12 +332,12 @@ def try_stack(
             "top_free_rects", [(0.0, 0.0, base["l"], base["b"])]
         )
         new_z = base["z"] + base["h"]
-        if new_z + item["h"] > truck_height + 1e-9:
+        if new_z + item["h"] > truck_height + eps:
             continue
 
         for ridx, (rx, ry, rl, rb) in enumerate(list(top_free_rects)):
             for il, ib in [(item["l"], item["b"]), (item["b"], item["l"])]:
-                if il <= rl + 1e-9 and ib <= rb + 1e-9:
+                if il <= rl + eps and ib <= rb + eps:
                     del top_free_rects[ridx]
                     right = (rx + il, ry, max(0.0, rl - il), ib)
                     top = (rx, ry + ib, rl, max(0.0, rb - ib))
@@ -253,6 +355,71 @@ def try_stack(
                         "h": item["h"],
                         "x": base["x"] + rx,
                         "y": base["y"] + ry,
+                        "z": new_z,
+                        "level": new_level,
+                        "top_free_rects": [(0.0, 0.0, il, ib)],
+                    }
+
+    # Bridge-stacking: allow spanning placement across multiple supports when
+    # their top surfaces are at the same z-height and fully cover the footprint.
+    top_levels = sorted({p["z"] + p["h"] for p in placements}, reverse=True)
+    for new_z in top_levels:
+        if new_z + item["h"] > truck_height + eps:
+            continue
+
+        support_entries: List[Tuple[Dict[str, Any], float, float, float, float]] = []
+        candidate_x: List[float] = []
+        candidate_y: List[float] = []
+        for base in placements:
+            if abs((base["z"] + base["h"]) - new_z) > eps:
+                continue
+            top_free_rects = base.setdefault("top_free_rects", [(0.0, 0.0, base["l"], base["b"])])
+            if not top_free_rects:
+                continue
+            for rx, ry, rl, rb in top_free_rects:
+                wx, wy = base["x"] + rx, base["y"] + ry
+                support_entries.append((base, wx, wy, rl, rb))
+                candidate_x.extend([wx, wx + rl])
+                candidate_y.extend([wy, wy + rb])
+        if not support_entries:
+            continue
+
+        for il, ib in [(item["l"], item["b"]), (item["b"], item["l"])]:
+            for x in sorted(set(candidate_x)):
+                for y in sorted(set(candidate_y)):
+                    world_rect = (x, y, il, ib)
+                    touched_support_rects: List[Tuple[float, float, float, float]] = []
+                    touched_bases: List[Dict[str, Any]] = []
+                    touched_ids = set()
+                    for base, sx, sy, sl, sb in support_entries:
+                        if _rect_overlap((sx, sy, sl, sb), world_rect, eps=eps) is None:
+                            continue
+                        touched_support_rects.append((sx, sy, sl, sb))
+                        bid = id(base)
+                        if bid not in touched_ids:
+                            touched_ids.add(bid)
+                            touched_bases.append(base)
+                    if not touched_support_rects:
+                        continue
+                    if not _footprint_fully_supported(x, y, il, ib, touched_support_rects, eps=eps):
+                        continue
+
+                    new_level = max(int(b.get("level", 0)) for b in touched_bases) + 1
+                    if any(new_level >= int(b.get("stack_limit", 2)) for b in touched_bases):
+                        continue
+
+                    for base in touched_bases:
+                        _reserve_base_top_area(base, world_rect)
+                    return {
+                        "idx": item["idx"],
+                        "ID": item["id"],
+                        "name": item["name"],
+                        "weight": item["weight"],
+                        "l": il,
+                        "b": ib,
+                        "h": item["h"],
+                        "x": x,
+                        "y": y,
                         "z": new_z,
                         "level": new_level,
                         "top_free_rects": [(0.0, 0.0, il, ib)],

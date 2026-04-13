@@ -63,9 +63,9 @@ def _plotly_color_for_placement(
     i: int, p: Dict[str, Any], adr_by_id: Dict[int, bool], cmap_name: str = "tab10"
 ) -> Tuple[str, float]:
     """Returns (plotly color string, opacity)."""
-    is_adr = adr_by_id.get(int(p["ID"]), False)
-    if is_adr:
-        return "rgb(220,90,80)", 1
+    # is_adr = adr_by_id.get(int(p["ID"]), False)
+    # if is_adr:
+    #     return "rgb(220,90,80)", 1
     cmap = plt.get_cmap(cmap_name)
     base = cmap(i % cmap.N)
     r, g, b = int(base[0] * 255), int(base[1] * 255), int(base[2] * 255)
