@@ -120,19 +120,14 @@ def build_items_for_loading(goods_df: pd.DataFrame, truck_width: float) -> List[
                 "adr_class": str(row.get("adr_class", "") or "").strip(),
             }
         )
-    # Geometry-first ordering to maximize space utilization; ignore weight priority.
-    # Defer floor-hog items that consume most of truck width so narrow items can
-    # seed back-right lanes first, preserving maneuvering space for later fits.
-    for item in items:
-        min_cross_width = min(item["l"], item["b"])
-        item["defer_wide_floor_hog"] = (
-            min_cross_width >= (0.75 * truck_width) and item["footprint"] >= 3.5
-        )
+    # Heaviest-first so the largest-mass SKU anchors at the rear; geometry ties
+    # break by volume / footprint then height.
     items.sort(
         key=lambda x: (
+            -x["weight"],
             -x["volume"],
-            -x["footprint"],  # Larger base first
-            x["h"],  # Shorter on ties: spread on deck before growing height
+            -x["footprint"],
+            x["h"],
         )
     )
     return items
@@ -305,8 +300,8 @@ def _reserve_base_top_area(
 
 def _preferred_orientations(item: Dict[str, Any]) -> List[Tuple[float, float]]:
     """
-    Orientation order that prioritizes using truck width (y) more than length (x):
-    prefer smaller footprint side along x and larger side along y.
+    Orientation order for floor/stack footprints: minimize extent along truck
+    length (+x) first, use the other horizontal side along width (+y).
     """
     a, b = float(item["l"]), float(item["b"])
     primary = (min(a, b), max(a, b))
@@ -333,13 +328,6 @@ def _guillotine_side_front(
     return side, front
 
 
-def _stack_elevation_key(
-    new_level: int, new_z: float, waste_frac: float, layer_sc: Tuple[float, float, float, float]
-) -> Tuple[int, float, float, Tuple[float, float, float, float]]:
-    """Lower is better: fewer stack layers, lower z, then shelf tightness / plan score."""
-    return (new_level, round(new_z, 6), round(waste_frac, 8), layer_sc)
-
-
 def _layer_score(p: Dict[str, Any]) -> Tuple[float, float, float, float]:
     """
     Lower is better for level-wise packing: minimize forward extent (x+l), stay at the
@@ -350,6 +338,22 @@ def _layer_score(p: Dict[str, Any]) -> Tuple[float, float, float, float]:
         round(float(p["x"]), 4),
         round(float(p["y"]), 4),
         round(float(p["z"]), 4),
+    )
+
+
+def _rear_choice_score(p: Dict[str, Any], extent_prior: float) -> Tuple[float, float, float, float, float]:
+    """
+    Lower is better: pack toward the back wall (small x), then keep overall +x reach
+    low, then lower z and y. Used to pick among floor vs stack without floor-first bias.
+    """
+    x = float(p["x"])
+    xl = x + float(p["l"])
+    return (
+        round(x, 4),
+        round(max(extent_prior, xl), 4),
+        round(float(p["z"]), 4),
+        round(float(p["y"]), 4),
+        round(xl, 4),
     )
 
 
@@ -376,12 +380,11 @@ def try_place_on_floor(
             if max_front_x is not None and (rx + il) > (max_front_x + 1e-9):
                 continue
 
-            # Tetris / back-first: fill from the back wall (small x), sweep y, keep cab
-            # end (+x) free as long as possible; prefer tight forward edge (rx+il).
+            # Rear-first: anchor at smallest x, then tight +x, sweep y; waste breaks ties.
             score = (
                 round(rx, 4),
-                round(ry, 4),
                 round(rx + il, 4),
+                round(ry, 4),
                 (rl * rb) - (il * ib),
                 -ib,
             )
@@ -424,13 +427,17 @@ def try_stack(
     base_allowed: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> Optional[Dict[str, Any]]:
     eps = 1e-9
+    extent_prior = (
+        max(float(p["x"]) + float(p["l"]) for p in placements) if placements else 0.0
+    )
     sorted_bases = sorted(
         placements,
         key=lambda p: (round(float(p["x"]), 4), round(float(p["y"]), 4), float(p["z"])),
     )
 
     best_global: Optional[Tuple[Tuple, Dict[str, Any], Tuple]] = None
-    # Tuple: ((waste_frac, _layer_score...), base, (ridx, rx, ry, il, ib, new_level, new_z))
+    # Tuple: (glob_tie, base, (ridx, rx, ry, il, ib, new_level, new_z))
+    # glob_tie minimizes how far the load reaches (+x) after this placement.
 
     for base in sorted_bases:
         if base_allowed is not None and not base_allowed(base):
@@ -457,10 +464,12 @@ def try_stack(
                 wx = float(base["x"]) + rx
                 wy = float(base["y"]) + ry
                 wf = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
+                new_extent = max(extent_prior, wx + il)
                 score = (
+                    round(wx, 4),
+                    round(new_extent, 4),
                     round(wf, 8),
                     round(wx + il, 4),
-                    round(wx, 4),
                     round(wy, 4),
                     -ib,
                 )
@@ -484,8 +493,14 @@ def try_stack(
             "h": float(item["h"]),
         }
         wf_g = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
-        glob_tie = _stack_elevation_key(
-            new_level, new_z, wf_g, _layer_score(cand_box)
+        new_extent_g = max(extent_prior, wx + il)
+        glob_tie = (
+            round(wx, 4),
+            round(new_extent_g, 4),
+            new_level,
+            round(new_z, 6),
+            round(wf_g, 8),
+            _layer_score(cand_box),
         )
         if best_global is None or glob_tie < best_global[0]:
             best_global = (glob_tie, base, (ridx, rx, ry, il, ib, new_level, new_z))
@@ -598,6 +613,8 @@ def try_stack_on_merged_coplanar_tops(
     if len(placements) < 2:
         return None
 
+    extent_prior = max(float(p["x"]) + float(p["l"]) for p in placements)
+
     by_ztop: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
     for p in placements:
         zt = round(float(p["z"]) + float(p["h"]), 6)
@@ -672,13 +689,15 @@ def try_stack_on_merged_coplanar_tops(
                         }
                         sc = _layer_score(cand)
                         wf_m = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
+                        new_extent = max(extent_prior, wx + il)
                         tie = (
+                            round(wx, 4),
+                            round(new_extent, 4),
                             new_level,
                             round(Zt, 6),
                             round(wf_m, 8),
                             sc,
                             round(wx + il, 4),
-                            round(wx, 4),
                             round(wy, 4),
                             -ib,
                         )
@@ -1150,11 +1169,11 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
         else:
             pending.append(item)
 
-    # Highest volume first; larger footprint; shorter height on ties to limit extra layers.
-    # Floor first; then stack on merged coplanar tops (>=2 bases); then lone tops; fallback.
+    # Heaviest first (matches build_items_for_loading); geometry breaks ties.
     pack_order = sorted(
         pending,
         key=lambda x: (
+            -float(x["weight"]),
             -float(x["volume"]),
             -float(x["footprint"]),
             float(x["h"]),
@@ -1167,6 +1186,9 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
             unplaced.append(item)
             continue
 
+        extent_prior = (
+            max(float(p["x"]) + float(p["l"]) for p in placements) if placements else 0.0
+        )
         floor_level_items = [p for p in placements if int(p.get("level", 0)) == 0]
         floor_frontier_x: Optional[float] = (
             max(float(p["x"]) + float(p["l"]) for p in floor_level_items)
@@ -1174,34 +1196,73 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
             else None
         )
 
-        placed: Optional[Dict[str, Any]] = None
+        # Rear-first: evaluate deck (optionally within current floor +x envelope) and
+        # all stack modes together; pick the option that sits most toward the back (small
+        # x) without biasing toward the floor when a stack at the rear is better.
+        best_pack: Optional[
+            Tuple[Tuple[float, ...], str, Dict[str, Any], Optional[List], Optional[List]]
+        ] = None
 
-        # Prefer deck footprint: use in-depth floor and extend +x before stacking.
+        def _consider(tag: str, placed: Optional[Dict[str, Any]], fr: Any, probe: Any) -> None:
+            nonlocal best_pack
+            if placed is None:
+                return
+            sc = _rear_choice_score(placed, extent_prior)
+            floor_bias = 1 if tag in ("floor_c", "floor") else 0
+            rank = (*sc, floor_bias)
+            if best_pack is None or rank < best_pack[0]:
+                best_pack = (rank, tag, placed, fr, probe)
+
         if floor_frontier_x is not None:
-            placed = try_place_on_floor(
-                item,
-                free_rects,
-                t_height,
-                max_front_x=floor_frontier_x,
+            fr_c = [tuple(r) for r in free_rects]
+            _consider(
+                "floor_c",
+                try_place_on_floor(item, fr_c, t_height, max_front_x=floor_frontier_x),
+                fr_c,
+                None,
             )
 
-        if placed is None:
-            placed = try_place_on_floor(item, free_rects, t_height, max_front_x=None)
+        fr_f = [tuple(r) for r in free_rects]
+        _consider(
+            "floor",
+            try_place_on_floor(item, fr_f, t_height, max_front_x=None),
+            fr_f,
+            None,
+        )
 
-        # Multi-base coplanar tops (same top z), then single-base tops only, then fallback.
-        if placed is None and placements:
-            placed = try_stack_on_merged_coplanar_tops(
-                item, placements, t_height, t_length, t_width
+        if placements:
+            probe_m = copy.deepcopy(placements)
+            pm = try_stack_on_merged_coplanar_tops(
+                item, probe_m, t_height, t_length, t_width
             )
-        if placed is None and placements:
-            placed = try_stack(
+            _consider("merged", pm, None, None)
+
+        if placements:
+            probe_sl = copy.deepcopy(placements)
+            ps_l = try_stack(
                 item,
-                placements,
+                probe_sl,
                 t_height,
-                base_allowed=lambda b, pl=placements: _is_lonely_coplanar_top(b, pl),
+                base_allowed=lambda b, pl=probe_sl: _is_lonely_coplanar_top(b, pl),
             )
-        if placed is None and placements:
-            placed = try_stack(item, placements, t_height)
+            _consider("stack_l", ps_l, None, probe_sl)
+
+        if placements:
+            probe_sa = copy.deepcopy(placements)
+            ps_a = try_stack(item, probe_sa, t_height, None)
+            _consider("stack_a", ps_a, None, probe_sa)
+
+        placed: Optional[Dict[str, Any]] = None
+        if best_pack is not None:
+            _rank, tag, placed, fr_mut, probe_mut = best_pack
+            if tag in ("floor_c", "floor"):
+                free_rects[:] = fr_mut  # type: ignore[assignment]
+                placements.append(placed)
+            elif tag == "merged":
+                placements.append(placed)
+            else:
+                placements[:] = probe_mut  # type: ignore[assignment]
+                placements.append(placed)
 
         if placed is None:
             unplaced.append(item)
