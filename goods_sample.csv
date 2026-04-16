@@ -25,3 +25,4 @@ id,name,weight_kg,l,b,h,max_stack,adr,adr_class
 1031,kolli,950,1.50,1.20,0.90,10,false,
 1032,kolli,550,2.15,2.15,0.80,10,false,
 1033,kolli lukket bil,109,0.80,0.60,0.55,10,false,
+1099,kolli,550,2.15,0.3,0.80,10,false,
