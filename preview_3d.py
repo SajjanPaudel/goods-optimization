@@ -163,7 +163,7 @@ def build_plotly_figure(
         )
         volume_util_pct = (placed_volume / truck_volume * 100.0) if truck_volume > 0 else 0.0
         titles_list.append(
-            f"{p['truck']}<br><sup>{tl:g}×{tb:g}×{th:g} m cargo</sup> — "
+            f"{p['truck']} {tl:g}m × {tb:g}m × {th:g}m <br>"
             f"{p['placed_count']} goods, {p['weight_util_pct']:.0f}% wt, "
             f"{placed_volume:.1f}/{truck_volume:.1f} m³ ({volume_util_pct:.0f}% vol)"
         )

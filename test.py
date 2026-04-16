@@ -92,7 +92,7 @@ def adr_good_allowed_on_truck(item: Dict[str, Any], truck: pd.Series) -> bool:
     return gclass in allowed_set
 
 
-def build_items_for_loading(goods_df: pd.DataFrame) -> List[Dict[str, Any]]:
+def build_items_for_loading(goods_df: pd.DataFrame, truck_width: float) -> List[Dict[str, Any]]:
     """One dict per row with idx = position in current frame (0..n-1)."""
     df = goods_df.reset_index(drop=True)
     items: List[Dict[str, Any]] = []
@@ -114,7 +114,21 @@ def build_items_for_loading(goods_df: pd.DataFrame) -> List[Dict[str, Any]]:
                 "adr_class": str(row.get("adr_class", "") or "").strip(),
             }
         )
-    items.sort(key=lambda x: (x["weight"], x["volume"], x["footprint"]), reverse=True)
+    # Geometry-first ordering to maximize space utilization; ignore weight priority.
+    # Defer floor-hog items that consume most of truck width so narrow items can
+    # seed back-right lanes first, preserving maneuvering space for later fits.
+    for item in items:
+        min_cross_width = min(item["l"], item["b"])
+        item["defer_wide_floor_hog"] = (
+            min_cross_width >= (0.75 * truck_width) and item["footprint"] >= 3.5
+        )
+    items.sort(
+        key=lambda x: (
+            -x["volume"]
+            -x["footprint"], # Larger base first
+            -x["h"],         # Tallest first to define stack heights
+        )
+    )
     return items
 
 
@@ -283,38 +297,87 @@ def _reserve_base_top_area(
     base["top_free_rects"] = merge_free_rectangles(updated)
 
 
+def _preferred_orientations(item: Dict[str, Any]) -> List[Tuple[float, float]]:
+    """
+    Orientation order that prioritizes using truck width (y) more than length (x):
+    prefer smaller footprint side along x and larger side along y.
+    """
+    a, b = float(item["l"]), float(item["b"])
+    primary = (min(a, b), max(a, b))
+    secondary = (max(a, b), min(a, b))
+    if abs(primary[0] - secondary[0]) <= 1e-9 and abs(primary[1] - secondary[1]) <= 1e-9:
+        return [primary]
+    return [primary, secondary]
+
+
 def try_place_on_floor(
     item: Dict[str, Any],
     free_rects: List[Tuple[float, float, float, float]],
     truck_height: float,
+    max_front_x: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    for ridx, (rx, ry, rl, rb) in enumerate(list(free_rects)):
-        for il, ib in [(item["l"], item["b"]), (item["b"], item["l"])]:
-            if il <= rl + 1e-9 and ib <= rb + 1e-9 and item["h"] <= truck_height:
-                del free_rects[ridx]
-                right = (rx + il, ry, max(0.0, rl - il), ib)
-                top = (rx, ry + ib, rl, max(0.0, rb - ib))
-                for rect in (right, top):
-                    if rect[2] > 0.05 and rect[3] > 0.05:
-                        free_rects.append(rect)
-                free_rects[:] = merge_free_rectangles(free_rects)
-                return {
-                    "idx": item["idx"],
-                    "ID": item["id"],
-                    "name": item["name"],
-                    "weight": item["weight"],
-                    "l": il,
-                    "b": ib,
-                    "h": item["h"],
-                    "x": rx,
-                    "y": ry,
-                    "z": 0.0,
-                    "level": 0,
-                    # Free top-area rectangles (local to this placement top surface).
-                    "top_free_rects": [(0.0, 0.0, il, ib)],
-                }
-    return None
+    best: Optional[Tuple[Tuple[float, float, float, float, float], int, float, float, float, float]] = None
 
+    for ridx, (rx, ry, rl, rb) in enumerate(free_rects):
+        for il, ib in _preferred_orientations(item):
+            if il > rl + 1e-9 or ib > rb + 1e-9 or item["h"] > truck_height:
+                continue
+            
+            # Constraint: Stay within the current "load zone" if provided
+            if max_front_x is not None and (rx + il) > (max_front_x + 1e-9):
+                continue
+
+            # HUMAN-LIKE SCORING:
+            # 1. Minimize x (Back of truck)
+            # 2. Minimize y (Side of truck) - creates "lanes"
+            # 3. Minimize area waste
+            score = (
+                round(rx, 2),    # Push to the very back
+                round(ry, 2),    # Push to the side (Back-Right corner)
+                (rl * rb) - (il * ib), 
+                il,              
+                -ib,             
+            )
+            cand = (score, ridx, rx, ry, il, ib)
+            if best is None or cand[0] < best[0]:
+                best = cand
+
+    if best is not None:
+        _, ridx, rx, ry, il, ib = best
+        rl, rb = free_rects[ridx][2], free_rects[ridx][3]
+        del free_rects[ridx]
+        
+        # Split rectangles in a way that favors the back-wall integrity
+        # We create one wide rectangle in front of the item and one narrow to the side
+        if (rl - il) > (rb - ib):
+            # Remaining space is mostly in front
+            side = (rx, ry + ib, il, rb - ib)
+            front = (rx + il, ry, rl - il, rb)
+        else:
+            # Remaining space is mostly to the side
+            side = (rx, ry + ib, rl, rb - ib)
+            front = (rx + il, ry, rl - il, ib)
+
+        for rect in (side, front):
+            if rect[2] > 0.05 and rect[3] > 0.05:
+                free_rects.append(rect)
+                
+        free_rects[:] = merge_free_rectangles(free_rects)
+        return {
+            "idx": item["idx"],
+            "ID": item["id"],
+            "name": item["name"],
+            "weight": item["weight"],
+            "l": il,
+            "b": ib,
+            "h": item["h"],
+            "x": rx,
+            "y": ry,
+            "z": 0.0,
+            "level": 0,
+            "top_free_rects": [(0.0, 0.0, il, ib)],
+        }
+    return None
 
 def try_stack(
     item: Dict[str, Any],
@@ -322,108 +385,65 @@ def try_stack(
     truck_height: float,
 ) -> Optional[Dict[str, Any]]:
     eps = 1e-9
-    for base in sorted(placements, key=lambda p: (p["weight"], p["l"] * p["b"]), reverse=True):
+    # Sort placements to find the back-most, side-most stable base
+    sorted_bases = sorted(
+        placements, 
+        key=lambda p: (round(p["x"], 2), round(p["y"], 2), -p["z"])
+    )
+
+    for base in sorted_bases:
         new_level = int(base.get("level", 0)) + 1
-        # Stack limit is interpreted as max allowed levels count per column:
-        # max_stack=2 allows level 0 (base) and level 1 (one tier above).
         if new_level >= int(base.get("stack_limit", 2)):
             continue
-        top_free_rects: List[Tuple[float, float, float, float]] = base.setdefault(
-            "top_free_rects", [(0.0, 0.0, base["l"], base["b"])]
-        )
+            
+        top_free_rects = base.setdefault("top_free_rects", [(0.0, 0.0, base["l"], base["b"])])
         new_z = base["z"] + base["h"]
         if new_z + item["h"] > truck_height + eps:
             continue
 
-        for ridx, (rx, ry, rl, rb) in enumerate(list(top_free_rects)):
-            for il, ib in [(item["l"], item["b"]), (item["b"], item["l"])]:
-                if il <= rl + eps and ib <= rb + eps:
-                    del top_free_rects[ridx]
-                    right = (rx + il, ry, max(0.0, rl - il), ib)
-                    top = (rx, ry + ib, rl, max(0.0, rb - ib))
-                    for rect in (right, top):
-                        if rect[2] > 0.05 and rect[3] > 0.05:
-                            top_free_rects.append(rect)
-                    base["top_free_rects"] = merge_free_rectangles(top_free_rects)
-                    return {
-                        "idx": item["idx"],
-                        "ID": item["id"],
-                        "name": item["name"],
-                        "weight": item["weight"],
-                        "l": il,
-                        "b": ib,
-                        "h": item["h"],
-                        "x": base["x"] + rx,
-                        "y": base["y"] + ry,
-                        "z": new_z,
-                        "level": new_level,
-                        "top_free_rects": [(0.0, 0.0, il, ib)],
-                    }
-
-    # Bridge-stacking: allow spanning placement across multiple supports when
-    # their top surfaces are at the same z-height and fully cover the footprint.
-    top_levels = sorted({p["z"] + p["h"] for p in placements}, reverse=True)
-    for new_z in top_levels:
-        if new_z + item["h"] > truck_height + eps:
-            continue
-
-        support_entries: List[Tuple[Dict[str, Any], float, float, float, float]] = []
-        candidate_x: List[float] = []
-        candidate_y: List[float] = []
-        for base in placements:
-            if abs((base["z"] + base["h"]) - new_z) > eps:
-                continue
-            top_free_rects = base.setdefault("top_free_rects", [(0.0, 0.0, base["l"], base["b"])])
-            if not top_free_rects:
-                continue
-            for rx, ry, rl, rb in top_free_rects:
-                wx, wy = base["x"] + rx, base["y"] + ry
-                support_entries.append((base, wx, wy, rl, rb))
-                candidate_x.extend([wx, wx + rl])
-                candidate_y.extend([wy, wy + rb])
-        if not support_entries:
-            continue
-
-        for il, ib in [(item["l"], item["b"]), (item["b"], item["l"])]:
-            for x in sorted(set(candidate_x)):
-                for y in sorted(set(candidate_y)):
-                    world_rect = (x, y, il, ib)
-                    touched_support_rects: List[Tuple[float, float, float, float]] = []
-                    touched_bases: List[Dict[str, Any]] = []
-                    touched_ids = set()
-                    for base, sx, sy, sl, sb in support_entries:
-                        if _rect_overlap((sx, sy, sl, sb), world_rect, eps=eps) is None:
-                            continue
-                        touched_support_rects.append((sx, sy, sl, sb))
-                        bid = id(base)
-                        if bid not in touched_ids:
-                            touched_ids.add(bid)
-                            touched_bases.append(base)
-                    if not touched_support_rects:
-                        continue
-                    if not _footprint_fully_supported(x, y, il, ib, touched_support_rects, eps=eps):
-                        continue
-
-                    new_level = max(int(b.get("level", 0)) for b in touched_bases) + 1
-                    if any(new_level >= int(b.get("stack_limit", 2)) for b in touched_bases):
-                        continue
-
-                    for base in touched_bases:
-                        _reserve_base_top_area(base, world_rect)
-                    return {
-                        "idx": item["idx"],
-                        "ID": item["id"],
-                        "name": item["name"],
-                        "weight": item["weight"],
-                        "l": il,
-                        "b": ib,
-                        "h": item["h"],
-                        "x": x,
-                        "y": y,
-                        "z": new_z,
-                        "level": new_level,
-                        "top_free_rects": [(0.0, 0.0, il, ib)],
-                    }
+        best_top = None
+        for ridx, (rx, ry, rl, rb) in enumerate(top_free_rects):
+            for il, ib in _preferred_orientations(item):
+                if il > rl + eps or ib > rb + eps:
+                    continue
+                
+                # Score to keep stacks aligned with the base item's corners
+                score = (
+                    round(base["x"] + rx, 2),
+                    round(base["y"] + ry, 2),
+                    (rl * rb) - (il * ib)
+                )
+                cand = (score, ridx, rx, ry, il, ib)
+                if best_top is None or cand[0] < best_top[0]:
+                    best_top = cand
+                    
+        if best_top is not None:
+            _, ridx, rx, ry, il, ib = best_top
+            rl, rb = top_free_rects[ridx][2], top_free_rects[ridx][3]
+            del top_free_rects[ridx]
+            
+            # Maintain top surface rectangles
+            side = (rx, ry + ib, il, rb - ib)
+            front = (rx + il, ry, rl - il, rb)
+            for rect in (side, front):
+                if rect[2] > 0.01 and rect[3] > 0.01:
+                    top_free_rects.append(rect)
+            
+            base["top_free_rects"] = merge_free_rectangles(top_free_rects)
+            return {
+                "idx": item["idx"],
+                "ID": item["id"],
+                "name": item["name"],
+                "weight": item["weight"],
+                "l": il,
+                "b": ib,
+                "h": item["h"],
+                "x": base["x"] + rx,
+                "y": base["y"] + ry,
+                "z": new_z,
+                "level": new_level,
+                "top_free_rects": [(0.0, 0.0, il, ib)],
+            }
     return None
 
 
@@ -482,7 +502,7 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
     geom_vol = t_length * t_width * t_height
     max_volume = float(truck["max_volume_m3"]) if pd.notna(truck["max_volume_m3"]) else geom_vol
 
-    items = build_items_for_loading(goods_df)
+    items = build_items_for_loading(goods_df, t_width)
     placements: List[Dict[str, Any]] = []
     free_rects: List[Tuple[float, float, float, float]] = [(0.0, 0.0, t_length, t_width)]
     total_weight = 0.0
@@ -496,9 +516,43 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
         if not can_load_by_capacity(item, total_weight, total_volume, max_weight, max_volume):
             unplaced.append(item)
             continue
-        placed = try_place_on_floor(item, free_rects, t_height)
-        if placed is None:
+        floor_level_items = [p for p in placements if int(p.get("level", 0)) == 0]
+        floor_frontier_x = (
+            max((p["x"] + p["l"]) for p in floor_level_items) if floor_level_items else None
+        )
+        # While evaluating availability, treat only the already-used floor depth as
+        # immediately usable. Expand toward the front only if needed.
+        bounded_floor_rects = [tuple(r) for r in free_rects]
+        floor_in_current_zone = (
+            try_place_on_floor(
+                item,
+                bounded_floor_rects,
+                t_height,
+                max_front_x=floor_frontier_x,
+            )
+            is not None
+        )
+
+        prefer_floor_first = (item["h"] <= 0.65) or (item["footprint"] >= 0.9)
+        placed: Optional[Dict[str, Any]] = None
+        if prefer_floor_first and floor_in_current_zone:
+            placed = try_place_on_floor(
+                item,
+                free_rects,
+                t_height,
+                max_front_x=floor_frontier_x,
+            )
+        else:
             placed = try_stack(item, placements, t_height)
+            if placed is None and floor_in_current_zone:
+                placed = try_place_on_floor(
+                    item,
+                    free_rects,
+                    t_height,
+                    max_front_x=floor_frontier_x,
+                )
+            if placed is None:
+                placed = try_place_on_floor(item, free_rects, t_height)
         if placed is None:
             unplaced.append(item)
             continue
