@@ -130,9 +130,9 @@ def build_items_for_loading(goods_df: pd.DataFrame, truck_width: float) -> List[
         )
     items.sort(
         key=lambda x: (
-            -x["volume"]
-            -x["footprint"], # Larger base first
-            -x["h"],         # Tallest first to define stack heights
+            -x["volume"],
+            -x["footprint"],  # Larger base first
+            x["h"],  # Shorter on ties: spread on deck before growing height
         )
     )
     return items
@@ -333,6 +333,13 @@ def _guillotine_side_front(
     return side, front
 
 
+def _stack_elevation_key(
+    new_level: int, new_z: float, waste_frac: float, layer_sc: Tuple[float, float, float, float]
+) -> Tuple[int, float, float, Tuple[float, float, float, float]]:
+    """Lower is better: fewer stack layers, lower z, then shelf tightness / plan score."""
+    return (new_level, round(new_z, 6), round(waste_frac, 8), layer_sc)
+
+
 def _layer_score(p: Dict[str, Any]) -> Tuple[float, float, float, float]:
     """
     Lower is better for level-wise packing: minimize forward extent (x+l), stay at the
@@ -419,7 +426,7 @@ def try_stack(
     eps = 1e-9
     sorted_bases = sorted(
         placements,
-        key=lambda p: (round(float(p["x"]), 4), round(float(p["y"]), 4), -float(p["z"])),
+        key=lambda p: (round(float(p["x"]), 4), round(float(p["y"]), 4), float(p["z"])),
     )
 
     best_global: Optional[Tuple[Tuple, Dict[str, Any], Tuple]] = None
@@ -477,7 +484,9 @@ def try_stack(
             "h": float(item["h"]),
         }
         wf_g = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
-        glob_tie = (round(wf_g, 8), _layer_score(cand_box))
+        glob_tie = _stack_elevation_key(
+            new_level, new_z, wf_g, _layer_score(cand_box)
+        )
         if best_global is None or glob_tie < best_global[0]:
             best_global = (glob_tie, base, (ridx, rx, ry, il, ib, new_level, new_z))
 
@@ -564,7 +573,16 @@ def _axis_samples(lo: float, hi: float, maxn: int = 11) -> List[float]:
     return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
 
 
-def try_stack_on_merged_rear_floor_shelf(
+def _is_lonely_coplanar_top(
+    base: Dict[str, Any], placements: List[Dict[str, Any]], eps: float = 1e-4
+) -> bool:
+    """True if no other placement shares this base's top z (single-base shelf only)."""
+    zt = float(base["z"]) + float(base["h"])
+    n = sum(1 for p in placements if abs(float(p["z"]) + float(p["h"]) - zt) <= eps)
+    return n == 1
+
+
+def try_stack_on_merged_coplanar_tops(
     item: Dict[str, Any],
     placements: List[Dict[str, Any]],
     truck_height: float,
@@ -573,26 +591,23 @@ def try_stack_on_merged_rear_floor_shelf(
     eps: float = 1e-4,
 ) -> Optional[Dict[str, Any]]:
     """
-    Stack on the union of coplanar top faces of the rear floor cluster (min x on floor),
-    after subtracting whatever already sits on that shelf. Lets wide items use combined
-    space over e.g. 1032 + 1099 at the same z-height, which single-base try_stack cannot.
+    Stack only on shelves formed by >=2 placements sharing the same top z (coplanar tops),
+    after subtracting whatever already sits on that plane. Wide items can span multiple
+    bases at the same elevation; lone tops are left to try_stack.
     """
-    floor = [p for p in placements if int(p.get("level", 0)) == 0]
-    if not floor:
-        return None
-    min_xf = min(float(p["x"]) for p in floor)
-    back_floor = [p for p in floor if float(p["x"]) <= min_xf + eps]
-    if not back_floor:
+    if len(placements) < 2:
         return None
 
     by_ztop: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
-    for p in back_floor:
+    for p in placements:
         zt = round(float(p["z"]) + float(p["h"]), 6)
         by_ztop[zt].append(p)
 
     best: Optional[Tuple[Tuple[float, float, float, float], Dict[str, Any]]] = None
 
     for _zk, parts in by_ztop.items():
+        if len(parts) < 2:
+            continue
         Zt = float(parts[0]["z"]) + float(parts[0]["h"])
         if Zt + float(item["h"]) > truck_height + eps:
             continue
@@ -658,6 +673,8 @@ def try_stack_on_merged_rear_floor_shelf(
                         sc = _layer_score(cand)
                         wf_m = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
                         tie = (
+                            new_level,
+                            round(Zt, 6),
                             round(wf_m, 8),
                             sc,
                             round(wx + il, 4),
@@ -790,22 +807,43 @@ def refine_upper_levels_toward_back(
                 _rebuild_top_free_rects_from_geometry(placements)
                 item = _placement_to_item_dict(P)
                 probe_m = copy.deepcopy(placements)
-                cand_m = try_stack_on_merged_rear_floor_shelf(
+                cand_m = try_stack_on_merged_coplanar_tops(
                     item, probe_m, t_height, t_length, t_width
                 )
-                probe_s = copy.deepcopy(placements)
-                cand_s = try_stack(
+                probe_s1 = copy.deepcopy(placements)
+                cand_s1 = try_stack(
                     item,
-                    probe_s,
+                    probe_s1,
+                    t_height,
+                    base_allowed=lambda b: base_in_back_zone(b)
+                    and _is_lonely_coplanar_top(b, probe_s1),
+                )
+                probe_s2 = copy.deepcopy(placements)
+                cand_s2 = try_stack(
+                    item,
+                    probe_s2,
                     t_height,
                     base_allowed=base_in_back_zone,
                 )
                 cand_opts: List[Tuple[Tuple[float, float, float, float], Dict[str, Any], List]] = []
                 if cand_m is not None and _layer_score(cand_m) < old_score:
                     cand_opts.append((_layer_score(cand_m), cand_m, probe_m))
-                if cand_s is not None and _layer_score(cand_s) < old_score:
-                    cand_opts.append((_layer_score(cand_s), cand_s, probe_s))
-                cand_entry = min(cand_opts, key=lambda t: t[0]) if cand_opts else None
+                if cand_s1 is not None and _layer_score(cand_s1) < old_score:
+                    cand_opts.append((_layer_score(cand_s1), cand_s1, probe_s1))
+                if cand_s2 is not None and _layer_score(cand_s2) < old_score:
+                    cand_opts.append((_layer_score(cand_s2), cand_s2, probe_s2))
+                cand_entry = (
+                    min(
+                        cand_opts,
+                        key=lambda t: (
+                            t[0],
+                            int(t[1].get("level", 0)),
+                            round(float(t[1]["z"]), 6),
+                        ),
+                    )
+                    if cand_opts
+                    else None
+                )
                 if cand_entry is None:
                     placements.append(P)
                     _rebuild_top_free_rects_from_geometry(placements)
@@ -1112,10 +1150,16 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
         else:
             pending.append(item)
 
-    # Highest volume first; then larger footprint / height so big bases seed the rear.
+    # Highest volume first; larger footprint; shorter height on ties to limit extra layers.
+    # Floor first; then stack on merged coplanar tops (>=2 bases); then lone tops; fallback.
     pack_order = sorted(
         pending,
-        key=lambda x: (-float(x["volume"]), -float(x["footprint"]), -float(x["h"]), int(x["idx"])),
+        key=lambda x: (
+            -float(x["volume"]),
+            -float(x["footprint"]),
+            float(x["h"]),
+            int(x["idx"]),
+        ),
     )
 
     for item in pack_order:
@@ -1129,30 +1173,11 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
             if floor_level_items
             else None
         )
-        # Remaining breadth beside the *back* floor cluster only (min x on floor). If we
-        # used global max(y+b), forward floor rows (same plan, larger x) would hide the
-        # wall strip beside 1032 and force narrow kollis to stack instead.
-        min_x_floor = min(float(p["x"]) for p in floor_level_items) if floor_level_items else 0.0
-        back_floor = [
-            p
-            for p in floor_level_items
-            if float(p["x"]) <= min_x_floor + 1e-6
-        ]
-        max_y_back = (
-            max(float(p["y"]) + float(p["b"]) for p in back_floor) if back_floor else 0.0
-        )
-        strip_y = float(t_width) - max_y_back
-        min_footprint_edge = min(float(item["l"]), float(item["b"]))
-        # Narrow goods can use remaining breadth beside the rear row (e.g. kolli beside 1032).
-        prefer_strip_floor_first = (
-            floor_frontier_x is not None
-            and strip_y > _MIN_FREE_DIM + 1e-9
-            and min_footprint_edge <= strip_y + 1e-9
-        )
 
         placed: Optional[Dict[str, Any]] = None
 
-        if prefer_strip_floor_first:
+        # Prefer deck footprint: use in-depth floor and extend +x before stacking.
+        if floor_frontier_x is not None:
             placed = try_place_on_floor(
                 item,
                 free_rects,
@@ -1160,26 +1185,23 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
                 max_front_x=floor_frontier_x,
             )
 
-        # Stack on combined rear-floor shelf (coplanar tops, e.g. 1032 + 1099), then single-base.
+        if placed is None:
+            placed = try_place_on_floor(item, free_rects, t_height, max_front_x=None)
+
+        # Multi-base coplanar tops (same top z), then single-base tops only, then fallback.
         if placed is None and placements:
-            placed = try_stack_on_merged_rear_floor_shelf(
+            placed = try_stack_on_merged_coplanar_tops(
                 item, placements, t_height, t_length, t_width
             )
         if placed is None and placements:
-            placed = try_stack(item, placements, t_height)
-
-        # Floor within current max floor length (wide goods after failed stack).
-        if placed is None and floor_frontier_x is not None:
-            placed = try_place_on_floor(
+            placed = try_stack(
                 item,
-                free_rects,
+                placements,
                 t_height,
-                max_front_x=floor_frontier_x,
+                base_allowed=lambda b, pl=placements: _is_lonely_coplanar_top(b, pl),
             )
-
-        # Extend floor along +x when stack and in-depth floor both failed.
-        if placed is None:
-            placed = try_place_on_floor(item, free_rects, t_height, max_front_x=None)
+        if placed is None and placements:
+            placed = try_stack(item, placements, t_height)
 
         if placed is None:
             unplaced.append(item)
