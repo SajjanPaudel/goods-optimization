@@ -1,2 +1,2 @@
 id,name,l,b,h,max_weight_kg,max_volume_m3,adr_suitable,adr_classes_allowed
-T_SMALL,Small truck,8.46,2.55,3.35,32000,50.0,true,None
+T_MEDIUM,Medium truck,12.58,2.98,3.56,50000,100.0,true,None

@@ -4,7 +4,7 @@ Goods–truck allocation: standardized pandas DataFrames only (no parsing, no cl
 
 import copy
 from collections import defaultdict
-from itertools import combinations
+from itertools import combinations, permutations
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -22,6 +22,20 @@ _DATA_DIR = Path(__file__).resolve().parent
 # Minimum free-rectangle edge (m); keep consistent so merge does not drop strips
 # that stacking still appends, which used to yield [] tops and full-surface resets.
 _MIN_FREE_DIM = 0.01
+# Items with volume below this cap (and below a fraction of truck box volume) are biased
+# toward +x ("front" / cab-ward in this coordinate system) on floor and when stacking.
+_SMALL_ITEM_VOL_ABS_M3 = 0.35
+_SMALL_ITEM_VOL_FRAC_OF_CARGO = 0.0025
+
+
+def _volume_small_for_front(item: Dict[str, Any], cargo_geom_vol: Optional[float]) -> bool:
+    if cargo_geom_vol is None or cargo_geom_vol <= 0:
+        return float(item.get("volume", 0.0)) <= _SMALL_ITEM_VOL_ABS_M3
+    cap = max(
+        _SMALL_ITEM_VOL_ABS_M3,
+        _SMALL_ITEM_VOL_FRAC_OF_CARGO * float(cargo_geom_vol),
+    )
+    return float(item.get("volume", 0.0)) <= cap
 
 
 def _normalize_adr_class(val: Any) -> str:
@@ -113,6 +127,7 @@ def build_items_for_loading(goods_df: pd.DataFrame, truck_width: float) -> List[
                 "l": float(row["l"]),
                 "b": float(row["b"]),
                 "h": float(row["h"]),
+                "stackable": _as_bool(row.get("stackable", True), True),
                 "max_stack": int(row["max_stack"]),
                 "volume": _item_volume(row),
                 "footprint": _item_footprint(row),
@@ -120,7 +135,7 @@ def build_items_for_loading(goods_df: pd.DataFrame, truck_width: float) -> List[
                 "adr_class": str(row.get("adr_class", "") or "").strip(),
             }
         )
-    # Geometry-first ordering to maximize space utilization; ignore weight priority.
+    # Prioritize floor surface area coverage first (footprint), not weight.
     # Defer floor-hog items that consume most of truck width so narrow items can
     # seed back-right lanes first, preserving maneuvering space for later fits.
     for item in items:
@@ -130,8 +145,8 @@ def build_items_for_loading(goods_df: pd.DataFrame, truck_width: float) -> List[
         )
     items.sort(
         key=lambda x: (
+            -x["footprint"],  # Larger base first (surface-area priority)
             -x["volume"],
-            -x["footprint"],  # Larger base first
             x["h"],  # Shorter on ties: spread on deck before growing height
         )
     )
@@ -335,9 +350,9 @@ def _guillotine_side_front(
 
 def _stack_elevation_key(
     new_level: int, new_z: float, waste_frac: float, layer_sc: Tuple[float, float, float, float]
-) -> Tuple[int, float, float, Tuple[float, float, float, float]]:
-    """Lower is better: fewer stack layers, lower z, then shelf tightness / plan score."""
-    return (new_level, round(new_z, 6), round(waste_frac, 8), layer_sc)
+) -> Tuple[int, float, Tuple[float, float, float, float], float]:
+    """Lower is better: fewer stack layers, lower z, plan score, then top-surface waste."""
+    return (new_level, round(new_z, 6), layer_sc, round(waste_frac, 8))
 
 
 def _layer_score(p: Dict[str, Any]) -> Tuple[float, float, float, float]:
@@ -353,38 +368,237 @@ def _layer_score(p: Dict[str, Any]) -> Tuple[float, float, float, float]:
     )
 
 
+def _layer_score_for_item(
+    item: Dict[str, Any],
+    p: Dict[str, Any],
+    cargo_geom_vol: Optional[float],
+) -> Tuple[float, float, float, float]:
+    """Like _layer_score, but small-volume items prefer larger +x (front of load)."""
+    xl = round(float(p["x"]) + float(p["l"]), 4)
+    x0 = round(float(p["x"]), 4)
+    y = round(float(p["y"]), 4)
+    z = round(float(p["z"]), 4)
+    if _volume_small_for_front(item, cargo_geom_vol):
+        return (-xl, -x0, y, z)
+    return (xl, x0, y, z)
+
+
 def _stack_top_waste_frac(il: float, ib: float, rl: float, rb: float, eps: float = 1e-12) -> float:
     """Fraction of free top rectangle still empty after placing (il, ib); lower = better shelf use."""
     denom = rl * rb + eps
     return max(0.0, (rl * rb - il * ib) / denom)
 
 
+def _candidate_longitudinal_balance_score(
+    candidate: Dict[str, Any], placements: List[Dict[str, Any]], truck_length: float
+) -> float:
+    """
+    Lower is better: keep the longitudinal center of mass near the truck midpoint
+    to reduce front/rear axle concentration.
+    """
+    total_weight = float(candidate["weight"])
+    weighted_x = float(candidate["weight"]) * (
+        float(candidate["x"]) + 0.5 * float(candidate["l"])
+    )
+    for p in placements:
+        w = float(p["weight"])
+        total_weight += w
+        weighted_x += w * (float(p["x"]) + 0.5 * float(p["l"]))
+    if total_weight <= 1e-12:
+        return 0.0
+    com_x = weighted_x / total_weight
+    return abs(com_x - 0.5 * truck_length)
+
+
+def _placement_overlaps_any_base(
+    placement: Dict[str, Any], support_bases: List[Dict[str, Any]], eps: float = 1e-9
+) -> bool:
+    px, py = float(placement["x"]), float(placement["y"])
+    pl, pb = float(placement["l"]), float(placement["b"])
+    for base in support_bases:
+        bx, by = float(base["x"]), float(base["y"])
+        bl, bb = float(base["l"]), float(base["b"])
+        if _rect_overlap((px, py, pl, pb), (bx, by, bl, bb), eps=eps) is not None:
+            return True
+    return False
+
+
+def _direct_children_of_base(
+    placements: List[Dict[str, Any]], base: Dict[str, Any], eps: float = 1e-9
+) -> List[Dict[str, Any]]:
+    children: List[Dict[str, Any]] = []
+    base_top_z = float(base["z"]) + float(base["h"])
+    bx, by = float(base["x"]), float(base["y"])
+    bl, bb = float(base["l"]), float(base["b"])
+    for placement in placements:
+        if placement is base:
+            continue
+        if abs(float(placement["z"]) - base_top_z) > eps:
+            continue
+        px, py = float(placement["x"]), float(placement["y"])
+        pl, pb = float(placement["l"]), float(placement["b"])
+        if _rect_overlap((px, py, pl, pb), (bx, by, bl, bb), eps=eps) is not None:
+            children.append(placement)
+    return children
+
+
+def _direct_support_bases(
+    placements: List[Dict[str, Any]], placement: Dict[str, Any], eps: float = 1e-9
+) -> List[Dict[str, Any]]:
+    supporters: List[Dict[str, Any]] = []
+    pz = float(placement["z"])
+    if pz < eps:
+        return supporters
+    px, py = float(placement["x"]), float(placement["y"])
+    pl, pb = float(placement["l"]), float(placement["b"])
+    for base in placements:
+        if base is placement:
+            continue
+        base_top_z = float(base["z"]) + float(base["h"])
+        if abs(base_top_z - pz) > eps:
+            continue
+        bx, by = float(base["x"]), float(base["y"])
+        bl, bb = float(base["l"]), float(base["b"])
+        if _rect_overlap((px, py, pl, pb), (bx, by, bl, bb), eps=eps) is not None:
+            supporters.append(base)
+    return supporters
+
+
+def _ancestor_bases_closure(
+    placements: List[Dict[str, Any]], bases: List[Dict[str, Any]], eps: float = 1e-9
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+    stack = list(bases)
+    while stack:
+        base = stack.pop()
+        base_key = id(base)
+        if base_key in seen:
+            continue
+        seen.add(base_key)
+        out.append(base)
+        stack.extend(_direct_support_bases(placements, base, eps=eps))
+    return out
+
+
+def _descendant_weight_sum(
+    placements: List[Dict[str, Any]], base: Dict[str, Any], eps: float = 1e-9
+) -> float:
+    """
+    Sum the weight of all transitive descendants stacked above `base`.
+    Boxes spanning multiple supports count toward every base they rest on.
+    """
+    total = 0.0
+    seen: set[int] = set()
+    stack = _direct_children_of_base(placements, base, eps=eps)
+    while stack:
+        node = stack.pop()
+        node_key = id(node)
+        if node_key in seen:
+            continue
+        seen.add(node_key)
+        total += float(node["weight"])
+        stack.extend(_direct_children_of_base(placements, node, eps=eps))
+    return total
+
+
+def _weight_supported_by_bases(
+    candidate: Dict[str, Any],
+    support_bases: List[Dict[str, Any]],
+    placements: List[Dict[str, Any]],
+    eps: float = 1e-9,
+) -> bool:
+    """
+    Reject stacks when either:
+    1) the new item is heavier than any direct supporting base, or
+    2) the total transitive load above any supporting base would exceed that base's
+       own weight, or
+    3) the total transitive load above the full supporting base set would exceed the
+       combined weight of those base items.
+    """
+    item_weight = float(candidate["weight"])
+    for base in support_bases:
+        if item_weight > float(base["weight"]) + eps:
+            return False
+
+    augmented = list(placements)
+    augmented.append(candidate)
+
+    all_bases_to_check = _ancestor_bases_closure(augmented, support_bases, eps=eps)
+
+    for base in all_bases_to_check:
+        if _descendant_weight_sum(augmented, base, eps=eps) > float(base["weight"]) + eps:
+            return False
+
+    base_weight_sum = sum(float(base["weight"]) for base in support_bases)
+    combined_supported_sum = 0.0
+    seen_nodes: set[int] = set()
+    for base in support_bases:
+        stack = _direct_children_of_base(augmented, base, eps=eps)
+        while stack:
+            node = stack.pop()
+            node_key = id(node)
+            if node_key in seen_nodes:
+                continue
+            seen_nodes.add(node_key)
+            combined_supported_sum += float(node["weight"])
+            stack.extend(_direct_children_of_base(augmented, node, eps=eps))
+    return combined_supported_sum <= (base_weight_sum + eps)
+
+
 def try_place_on_floor(
     item: Dict[str, Any],
+    placements: List[Dict[str, Any]],
     free_rects: List[Tuple[float, float, float, float]],
     truck_height: float,
+    truck_length: float,
     max_front_x: Optional[float] = None,
+    cargo_geom_vol: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     best: Optional[Tuple[Tuple[float, float, float, float, float], int, float, float, float, float]] = None
+    front_small = _volume_small_for_front(item, cargo_geom_vol)
 
     for ridx, (rx, ry, rl, rb) in enumerate(free_rects):
         for il, ib in _preferred_orientations(item):
             if il > rl + 1e-9 or ib > rb + 1e-9 or item["h"] > truck_height:
                 continue
-            
+
             # Constraint: Stay within the current "load zone" if provided
             if max_front_x is not None and (rx + il) > (max_front_x + 1e-9):
                 continue
 
-            # Tetris / back-first: fill from the back wall (small x), sweep y, keep cab
-            # end (+x) free as long as possible; prefer tight forward edge (rx+il).
-            score = (
-                round(rx, 4),
-                round(ry, 4),
-                round(rx + il, 4),
-                (rl * rb) - (il * ib),
-                -ib,
+            cand_box = {
+                "x": rx,
+                "y": ry,
+                "z": 0.0,
+                "l": il,
+                "b": ib,
+                "h": float(item["h"]),
+                "weight": float(item["weight"]),
+            }
+            balance_sc = round(
+                _candidate_longitudinal_balance_score(cand_box, placements, truck_length), 4
             )
+
+            # Large items: back-first (small x). Small-by-volume: prefer +x (front / cab-ward).
+            if front_small:
+                score = (
+                    balance_sc,
+                    -round(rx + il, 4),
+                    -round(rx, 4),
+                    round(ry, 4),
+                    (rl * rb) - (il * ib),
+                    -ib,
+                )
+            else:
+                score = (
+                    balance_sc,
+                    round(rx, 4),
+                    round(ry, 4),
+                    round(rx + il, 4),
+                    (rl * rb) - (il * ib),
+                    -ib,
+                )
             cand = (score, ridx, rx, ry, il, ib)
             if best is None or cand[0] < best[0]:
                 best = cand
@@ -421,7 +635,9 @@ def try_stack(
     item: Dict[str, Any],
     placements: List[Dict[str, Any]],
     truck_height: float,
+    truck_length: float,
     base_allowed: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    cargo_geom_vol: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     eps = 1e-9
     sorted_bases = sorted(
@@ -447,7 +663,6 @@ def try_stack(
         new_z = float(base["z"]) + float(base["h"])
         if new_z + float(item["h"]) > truck_height + eps:
             continue
-
         best_top = None
         for ridx, (rx, ry, rl, rb) in enumerate(top_free_rects):
             for il, ib in _preferred_orientations(item):
@@ -456,14 +671,39 @@ def try_stack(
 
                 wx = float(base["x"]) + rx
                 wy = float(base["y"]) + ry
-                wf = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
-                score = (
-                    round(wf, 8),
-                    round(wx + il, 4),
-                    round(wx, 4),
-                    round(wy, 4),
-                    -ib,
+                cand_box = {
+                    "x": wx,
+                    "y": wy,
+                    "z": new_z,
+                    "l": il,
+                    "b": ib,
+                    "h": float(item["h"]),
+                    "weight": float(item["weight"]),
+                }
+                if not _weight_supported_by_bases(cand_box, [base], placements, eps=eps):
+                    continue
+                balance_sc = round(
+                    _candidate_longitudinal_balance_score(cand_box, placements, truck_length), 4
                 )
+                wf = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
+                if _volume_small_for_front(item, cargo_geom_vol):
+                    score = (
+                        balance_sc,
+                        round(wf, 8),
+                        -round(wx + il, 4),
+                        -round(wx, 4),
+                        round(wy, 4),
+                        -ib,
+                    )
+                else:
+                    score = (
+                        balance_sc,
+                        round(wf, 8),
+                        round(wx + il, 4),
+                        round(wx, 4),
+                        round(wy, 4),
+                        -ib,
+                    )
                 cand = (score, ridx, rx, ry, il, ib)
                 if best_top is None or cand[0] < best_top[0]:
                     best_top = cand
@@ -485,7 +725,7 @@ def try_stack(
         }
         wf_g = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
         glob_tie = _stack_elevation_key(
-            new_level, new_z, wf_g, _layer_score(cand_box)
+            new_level, new_z, wf_g, _layer_score_for_item(item, cand_box, cargo_geom_vol)
         )
         if best_global is None or glob_tie < best_global[0]:
             best_global = (glob_tie, base, (ridx, rx, ry, il, ib, new_level, new_z))
@@ -589,6 +829,7 @@ def try_stack_on_merged_coplanar_tops(
     t_length: float,
     t_width: float,
     eps: float = 1e-4,
+    cargo_geom_vol: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Stack only on shelves formed by >=2 placements sharing the same top z (coplanar tops),
@@ -653,6 +894,17 @@ def try_stack_on_merged_coplanar_tops(
                             wx, wy, il, ib, supports_full, eps=eps
                         ):
                             continue
+                        support_bases = [
+                            f
+                            for f in parts
+                            if any(
+                                abs(float(f["x"]) - sx) <= eps
+                                and abs(float(f["y"]) - sy) <= eps
+                                and abs(float(f["l"]) - sl) <= eps
+                                and abs(float(f["b"]) - sb) <= eps
+                                for sx, sy, sl, sb in supports_full
+                            )
+                        ]
                         new_level = 1 + max(int(p.get("level", 0)) for p in parts)
                         if new_level >= int(item.get("max_stack", 10)):
                             continue
@@ -670,15 +922,27 @@ def try_stack_on_merged_coplanar_tops(
                             "level": new_level,
                             "top_free_rects": [(0.0, 0.0, il, ib)],
                         }
-                        sc = _layer_score(cand)
+                        if not _weight_supported_by_bases(
+                            cand, support_bases, placements, eps=eps
+                        ):
+                            continue
+                        balance_sc = round(
+                            _candidate_longitudinal_balance_score(cand, placements, t_length), 4
+                        )
+                        sc = _layer_score_for_item(item, cand, cargo_geom_vol)
                         wf_m = _stack_top_waste_frac(il, ib, rl, rb, eps=eps)
+                        if _volume_small_for_front(item, cargo_geom_vol):
+                            x_tail = (-round(wx + il, 4), -round(wx, 4))
+                        else:
+                            x_tail = (round(wx + il, 4), round(wx, 4))
                         tie = (
                             new_level,
                             round(Zt, 6),
-                            round(wf_m, 8),
+                            balance_sc,
                             sc,
-                            round(wx + il, 4),
-                            round(wx, 4),
+                            round(wf_m, 8),
+                            x_tail[0],
+                            x_tail[1],
                             round(wy, 4),
                             -ib,
                         )
@@ -753,6 +1017,7 @@ def _placement_to_item_dict(p: Dict[str, Any]) -> Dict[str, Any]:
         "l": float(p["l"]),
         "b": float(p["b"]),
         "h": float(p["h"]),
+        "stackable": _as_bool(p.get("stackable", True), True),
         "max_stack": int(p.get("stack_limit", 10)),
         "volume": float(p["l"]) * float(p["b"]) * float(p["h"]),
         "footprint": float(p["l"]) * float(p["b"]),
@@ -766,6 +1031,7 @@ def refine_upper_levels_toward_back(
     t_length: float,
     t_width: float,
     t_height: float,
+    cargo_geom_vol: Optional[float] = None,
 ) -> None:
     """
     Repeated passes by level (1, 2, …): try to move a box that has nothing on top onto
@@ -802,43 +1068,58 @@ def refine_upper_levels_toward_back(
             for P in list(cands):
                 if P not in placements:
                     continue
-                old_score = _layer_score(P)
+                item = _placement_to_item_dict(P)
+                old_score = _layer_score_for_item(item, P, cargo_geom_vol)
                 placements.remove(P)
                 _rebuild_top_free_rects_from_geometry(placements)
-                item = _placement_to_item_dict(P)
-                probe_m = copy.deepcopy(placements)
-                cand_m = try_stack_on_merged_coplanar_tops(
-                    item, probe_m, t_height, t_length, t_width
-                )
                 probe_s1 = copy.deepcopy(placements)
                 cand_s1 = try_stack(
                     item,
                     probe_s1,
                     t_height,
+                    t_length,
                     base_allowed=lambda b: base_in_back_zone(b)
                     and _is_lonely_coplanar_top(b, probe_s1),
+                    cargo_geom_vol=cargo_geom_vol,
                 )
                 probe_s2 = copy.deepcopy(placements)
                 cand_s2 = try_stack(
                     item,
                     probe_s2,
                     t_height,
+                    t_length,
                     base_allowed=base_in_back_zone,
+                    cargo_geom_vol=cargo_geom_vol,
+                )
+                probe_m = copy.deepcopy(placements)
+                cand_m = try_stack_on_merged_coplanar_tops(
+                    item,
+                    probe_m,
+                    t_height,
+                    t_length,
+                    t_width,
+                    cargo_geom_vol=cargo_geom_vol,
                 )
                 cand_opts: List[Tuple[Tuple[float, float, float, float], Dict[str, Any], List]] = []
-                if cand_m is not None and _layer_score(cand_m) < old_score:
-                    cand_opts.append((_layer_score(cand_m), cand_m, probe_m))
-                if cand_s1 is not None and _layer_score(cand_s1) < old_score:
-                    cand_opts.append((_layer_score(cand_s1), cand_s1, probe_s1))
-                if cand_s2 is not None and _layer_score(cand_s2) < old_score:
-                    cand_opts.append((_layer_score(cand_s2), cand_s2, probe_s2))
+                if cand_s1 is not None and _layer_score_for_item(item, cand_s1, cargo_geom_vol) < old_score:
+                    cand_opts.append(
+                        (_layer_score_for_item(item, cand_s1, cargo_geom_vol), cand_s1, probe_s1)
+                    )
+                if cand_s2 is not None and _layer_score_for_item(item, cand_s2, cargo_geom_vol) < old_score:
+                    cand_opts.append(
+                        (_layer_score_for_item(item, cand_s2, cargo_geom_vol), cand_s2, probe_s2)
+                    )
+                if cand_m is not None and _layer_score_for_item(item, cand_m, cargo_geom_vol) < old_score:
+                    cand_opts.append(
+                        (_layer_score_for_item(item, cand_m, cargo_geom_vol), cand_m, probe_m)
+                    )
                 cand_entry = (
                     min(
                         cand_opts,
                         key=lambda t: (
-                            t[0],
                             int(t[1].get("level", 0)),
                             round(float(t[1]["z"]), 6),
+                            t[0],
                         ),
                     )
                     if cand_opts
@@ -1150,23 +1431,18 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
         else:
             pending.append(item)
 
-    # Highest volume first; larger footprint; shorter height on ties to limit extra layers.
-    # Floor first; then stack on merged coplanar tops (>=2 bases); then lone tops; fallback.
+    # Primary pass: floor surface area first across all eligible goods.
     pack_order = sorted(
         pending,
         key=lambda x: (
-            -float(x["volume"]),
             -float(x["footprint"]),
+            -float(x["volume"]),
             float(x["h"]),
             int(x["idx"]),
         ),
     )
 
-    for item in pack_order:
-        if not can_load_by_capacity(item, total_weight, total_volume, max_weight, max_volume):
-            unplaced.append(item)
-            continue
-
+    def _try_place_item(item: Dict[str, Any], *, prefer_stack_first: bool) -> Optional[Dict[str, Any]]:
         floor_level_items = [p for p in placements if int(p.get("level", 0)) == 0]
         floor_frontier_x: Optional[float] = (
             max(float(p["x"]) + float(p["l"]) for p in floor_level_items)
@@ -1174,49 +1450,124 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
             else None
         )
 
-        placed: Optional[Dict[str, Any]] = None
-
-        # Prefer deck footprint: use in-depth floor and extend +x before stacking.
-        if floor_frontier_x is not None:
-            placed = try_place_on_floor(
-                item,
-                free_rects,
-                t_height,
-                max_front_x=floor_frontier_x,
-            )
-
-        if placed is None:
-            placed = try_place_on_floor(item, free_rects, t_height, max_front_x=None)
-
-        # Multi-base coplanar tops (same top z), then single-base tops only, then fallback.
-        if placed is None and placements:
-            placed = try_stack_on_merged_coplanar_tops(
-                item, placements, t_height, t_length, t_width
-            )
-        if placed is None and placements:
-            placed = try_stack(
+        placed_local: Optional[Dict[str, Any]] = None
+        if prefer_stack_first and placements:
+            placed_local = try_stack_on_merged_coplanar_tops(
                 item,
                 placements,
                 t_height,
-                base_allowed=lambda b, pl=placements: _is_lonely_coplanar_top(b, pl),
+                t_length,
+                t_width,
+                cargo_geom_vol=geom_vol,
             )
-        if placed is None and placements:
-            placed = try_stack(item, placements, t_height)
+            if placed_local is None:
+                placed_local = try_stack(
+                    item,
+                    placements,
+                    t_height,
+                    t_length,
+                    base_allowed=lambda b, pl=placements: _is_lonely_coplanar_top(b, pl),
+                    cargo_geom_vol=geom_vol,
+                )
+            if placed_local is None:
+                placed_local = try_stack(
+                    item, placements, t_height, t_length, cargo_geom_vol=geom_vol
+                )
+
+        if placed_local is None and floor_frontier_x is not None:
+            placed_local = try_place_on_floor(
+                item,
+                placements,
+                free_rects,
+                t_height,
+                t_length,
+                max_front_x=floor_frontier_x,
+                cargo_geom_vol=geom_vol,
+            )
+        if placed_local is None:
+            placed_local = try_place_on_floor(
+                item,
+                placements,
+                free_rects,
+                t_height,
+                t_length,
+                max_front_x=None,
+                cargo_geom_vol=geom_vol,
+            )
+
+        if placed_local is None and (not prefer_stack_first) and placements:
+            placed_local = try_stack_on_merged_coplanar_tops(
+                item,
+                placements,
+                t_height,
+                t_length,
+                t_width,
+                cargo_geom_vol=geom_vol,
+            )
+            if placed_local is None:
+                placed_local = try_stack(
+                    item,
+                    placements,
+                    t_height,
+                    t_length,
+                    base_allowed=lambda b, pl=placements: _is_lonely_coplanar_top(b, pl),
+                    cargo_geom_vol=geom_vol,
+                )
+            if placed_local is None:
+                placed_local = try_stack(
+                    item, placements, t_height, t_length, cargo_geom_vol=geom_vol
+                )
+        return placed_local
+
+    for item in pack_order:
+        if not can_load_by_capacity(item, total_weight, total_volume, max_weight, max_volume):
+            unplaced.append(item)
+            continue
+
+        placed: Optional[Dict[str, Any]] = _try_place_item(
+            item,
+            prefer_stack_first=False,
+        )
 
         if placed is None:
             unplaced.append(item)
             continue
 
-        placed["stack_limit"] = item["max_stack"]
+        placed["stackable"] = _as_bool(item.get("stackable", True), True)
+        placed["stack_limit"] = int(item["max_stack"]) if placed["stackable"] else 1
         placements.append(placed)
         _rebuild_top_free_rects_from_geometry(placements)
         total_weight += item["weight"]
         total_volume += item["volume"]
 
+    # Secondary pass for non-stackable leftovers: attempt top insertion first.
+    if unplaced:
+        still_unplaced: List[Dict[str, Any]] = []
+        for item in unplaced:
+            if _as_bool(item.get("stackable", True), True):
+                still_unplaced.append(item)
+                continue
+            if not can_load_by_capacity(item, total_weight, total_volume, max_weight, max_volume):
+                still_unplaced.append(item)
+                continue
+            placed = _try_place_item(item, prefer_stack_first=True)
+            if placed is None:
+                still_unplaced.append(item)
+                continue
+            placed["stackable"] = _as_bool(item.get("stackable", True), True)
+            placed["stack_limit"] = int(item["max_stack"]) if placed["stackable"] else 1
+            placements.append(placed)
+            _rebuild_top_free_rects_from_geometry(placements)
+            total_weight += item["weight"]
+            total_volume += item["volume"]
+        unplaced = still_unplaced
+
     # Pull upper levels onto rear / within floor-plan tops where geometry allows (strict
     # improvement in forward extent), without moving level-0.
     if placements:
-        refine_upper_levels_toward_back(placements, t_length, t_width, t_height)
+        refine_upper_levels_toward_back(
+            placements, t_length, t_width, t_height, cargo_geom_vol=geom_vol
+        )
 
     # Pass 2: when several boxes share the same bottom z (a wide shelf / floor layer),
     # compact whole support columns along x to shorten how far the load reaches (+x).
@@ -1235,16 +1586,13 @@ def optimize_load(goods_df: pd.DataFrame, truck: pd.Series) -> Dict[str, Any]:
     )
 
 
-def allocate_with_subset(
-    goods_df: pd.DataFrame, truck_subset: pd.DataFrame
+def allocate_with_truck_order(
+    goods_df: pd.DataFrame, trucks_in_order: List[pd.Series]
 ) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
+    """Greedy load: fill each truck in sequence from the same remaining pool."""
     remaining = goods_df.copy().reset_index(drop=True)
     plans_local: List[Dict[str, Any]] = []
-    ordered = truck_subset.sort_values(
-        by=["adr_suitable", "max_weight_kg", "max_volume_m3", "l"],
-        ascending=[False, False, False, False],
-    )
-    for _, truck in ordered.iterrows():
+    for truck in trucks_in_order:
         if remaining.empty:
             break
         plan = optimize_load(remaining, truck)
@@ -1252,6 +1600,37 @@ def allocate_with_subset(
         loaded_idxs = {p["idx"] for p in plan["placements"]}
         remaining = remaining.drop(index=sorted(loaded_idxs)).reset_index(drop=True)
     return plans_local, remaining
+
+
+def allocate_with_subset(
+    goods_df: pd.DataFrame, truck_subset: pd.DataFrame
+) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
+    """
+    Try every order of trucks in the subset, then keep the best outcome.
+    Ranking: minimize leftover goods count, then maximize utilization_score.
+    (A single fixed 'big truck first' order can strand awkward pieces on the second truck.)
+    """
+    n = len(truck_subset)
+    if n == 0:
+        return [], goods_df.copy().reset_index(drop=True)
+
+    best_plans: Optional[List[Dict[str, Any]]] = None
+    best_remaining: Optional[pd.DataFrame] = None
+    best_rank: Optional[Tuple[int, float]] = None
+
+    for perm in permutations(range(n)):
+        trucks_in_order = [truck_subset.iloc[i] for i in perm]
+        plans_local, remaining = allocate_with_truck_order(goods_df, trucks_in_order)
+        n_unplaced = len(remaining)
+        util = utilization_score((plans_local, remaining))
+        rank = (n_unplaced, -util)
+        if best_rank is None or rank < best_rank:
+            best_rank = rank
+            best_plans = plans_local
+            best_remaining = remaining
+
+    assert best_plans is not None and best_remaining is not None
+    return best_plans, best_remaining
 
 
 def utilization_score(candidate: Tuple[List[Dict[str, Any]], pd.DataFrame]) -> float:
